@@ -1,0 +1,1 @@
+I ran DROP TABLE users on production. No backup, no rollback, 4 million accounts gone, and the deploy log says I was confident.
