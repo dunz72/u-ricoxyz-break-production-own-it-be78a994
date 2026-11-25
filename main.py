@@ -1,127 +1,139 @@
 #!/usr/bin/env python3
-"""Copy the Break Production, Own It entry into the grading output dir.
+"""Deliver the Break Production, Own It one-liner to the grading folder.
 
-The competition wants one line, 127 characters in our case, delivered as
-entry.txt inside $MAKEFUN_OUTPUT_DIR (falling back to /output). This
-script loads entry.txt from its own folder, validates the single-line
-gate, copies the bytes untouched, then re-reads the copy and checks the
-SHA-256 so a bad write is caught here, not on the grader.
+The entry is a single 127-character line stored in entry.txt next to this
+file. This program reads those bytes, checks the one-line rules, drops an
+untouched copy into $MAKEFUN_OUTPUT_DIR (or /output when that variable is
+absent), then reads the copy back and compares SHA-256 digests so a
+corrupt write fails loudly here instead of on the grader.
 
-Only the standard library is used: the grading image has no
-third-party packages installed.
+Standard library only: the grading image ships no third-party packages.
 """
 
 import hashlib
 import os
 import sys
+from pathlib import Path
 
-MAX_CHARS = 200
-MIN_CHARS = 1
+LOWER_BOUND = 1
+UPPER_BOUND = 200
+FALLBACK_DIR = "/output"
+ENTRY_NAME = "entry.txt"
 
 
-def fail(message):
-    """Print message to stderr and exit non-zero."""
-    sys.stderr.write("error: %s\n" % message)
+def abort(reason):
+    """Report a fatal problem on stderr and stop with status 1."""
+    sys.stderr.write("error: %s\n" % reason)
     raise SystemExit(1)
 
 
-def here():
-    """Absolute path of the folder holding this script."""
-    return os.path.dirname(os.path.abspath(__file__))
+def script_folder():
+    """Folder containing this script, resolved to an absolute path."""
+    return Path(__file__).resolve().parent
 
 
-def load_source():
-    """Read entry.txt next to this script; return its raw bytes."""
-    path = os.path.join(here(), "entry.txt")
+def fetch_entry_bytes():
+    """Return the raw bytes of entry.txt beside this script."""
+    entry_path = script_folder() / ENTRY_NAME
     try:
-        with open(path, "rb") as stream:
-            return stream.read()
-    except OSError as exc:
-        fail("cannot read %s: %s" % (path, exc))
+        return entry_path.read_bytes()
+    except OSError as problem:
+        abort("cannot read %s: %s" % (entry_path, problem))
 
 
-def as_text(raw):
-    """Decode raw bytes as UTF-8, failing on bad encoding."""
+def to_text(payload):
+    """Interpret payload as UTF-8 text, aborting on bad encoding."""
     try:
-        return raw.decode("utf-8")
+        return payload.decode("utf-8")
     except UnicodeDecodeError:
-        fail("entry.txt is not valid UTF-8")
+        abort("entry.txt is not valid UTF-8")
 
 
-def validate_line(line):
-    """Check the one-line gate: length 1-200, no newlines, no padding."""
-    if "\r" in line or "\n" in line:
-        fail("entry.txt must hold exactly one line, no line breaks")
-    size = len(line)
-    if size < MIN_CHARS:
-        fail("entry.txt is empty")
-    if size > MAX_CHARS:
-        fail("entry is %d chars, limit is %d" % (size, MAX_CHARS))
-    if line.strip() != line:
-        fail("entry.txt must not start or end with whitespace")
-    if not line.strip():
-        fail("entry.txt must not be blank")
-    if "\t" in line:
-        fail("entry.txt must not contain tab characters")
-    if "  " in line:
-        fail("entry.txt must not contain double spaces")
-    for ch in line:
-        if ord(ch) < 0x20 or ord(ch) == 0x7F:
-            fail("entry.txt must not contain control characters")
+def rule_checks(text):
+    """Yield (broken, message) pairs for every one-line rule."""
+    yield "\r" in text or "\n" in text, (
+        "entry.txt must hold exactly one line, no line breaks"
+    )
+    yield len(text) < LOWER_BOUND, "entry.txt is empty"
+    yield len(text) > UPPER_BOUND, (
+        "entry is %d chars, limit is %d" % (len(text), UPPER_BOUND)
+    )
+    yield text.strip() != text, (
+        "entry.txt must not start or end with whitespace"
+    )
+    yield not text.strip(), "entry.txt must not be blank"
+    yield "\t" in text, "entry.txt must not contain tab characters"
+    yield "  " in text, "entry.txt must not contain double spaces"
+    yield any(
+        ord(symbol) < 0x20 or ord(symbol) == 0x7F for symbol in text
+    ), "entry.txt must not contain control characters"
 
 
-def target_dir():
-    """Output folder from the environment, defaulting to /output."""
-    return os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+def enforce_rules(text):
+    """Abort on the first broken one-line rule, if any."""
+    for broken, message in rule_checks(text):
+        if broken:
+            abort(message)
 
 
-def make_dir(path):
-    """Create path (including parents) when missing."""
+def destination_folder():
+    """Output folder from the environment, falling back to /output."""
+    return Path(os.environ.get("MAKEFUN_OUTPUT_DIR") or FALLBACK_DIR)
+
+
+def prepare_folder(folder):
+    """Create folder and parents when they do not exist yet."""
     try:
-        os.makedirs(path, exist_ok=True)
-    except OSError as exc:
-        fail("cannot create output dir %s: %s" % (path, exc))
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError as problem:
+        abort("cannot create output dir %s: %s" % (folder, problem))
 
 
-def save(path, raw):
-    """Write raw bytes to path."""
+def store_copy(path, payload):
+    """Write payload bytes to path."""
     try:
-        with open(path, "wb") as stream:
-            stream.write(raw)
-    except OSError as exc:
-        fail("cannot write %s: %s" % (path, exc))
+        path.write_bytes(payload)
+    except OSError as problem:
+        abort("cannot write %s: %s" % (path, problem))
 
 
-def sha(raw):
-    """SHA-256 hex digest of raw bytes."""
-    return hashlib.sha256(raw).hexdigest()
+def fingerprint(payload):
+    """SHA-256 hex digest of payload bytes."""
+    return hashlib.sha256(payload).hexdigest()
 
 
-def verify_written(path, expected_digest):
-    """Re-read path and fail unless its digest equals expected_digest."""
+def confirm_copy(path, wanted, byte_count):
+    """Re-read path and abort unless size and digest match the source."""
     try:
-        with open(path, "rb") as stream:
-            written = stream.read()
-    except OSError as exc:
-        fail("cannot re-read %s: %s" % (path, exc))
-    if sha(written) != expected_digest:
-        fail("output differs from entry.txt (sha256 mismatch)")
+        copied = path.read_bytes()
+    except OSError as problem:
+        abort("cannot re-read %s: %s" % (path, problem))
+    if len(copied) != byte_count:
+        abort(
+            "output is %d bytes, expected %d" % (len(copied), byte_count)
+        )
+    if fingerprint(copied) != wanted:
+        abort("output differs from entry.txt (sha256 mismatch)")
 
 
-def main():
-    raw = load_source()
-    line = as_text(raw)
-    validate_line(line)
+def run():
+    payload = fetch_entry_bytes()
+    text = to_text(payload)
+    enforce_rules(text)
 
-    folder = target_dir()
-    make_dir(folder)
-    dest = os.path.join(folder, "entry.txt")
-    save(dest, raw)
-    verify_written(dest, sha(raw))
+    folder = destination_folder()
+    prepare_folder(folder)
+    target = folder / ENTRY_NAME
+    store_copy(target, payload)
+    digest = fingerprint(payload)
+    confirm_copy(target, digest, len(payload))
 
-    print("wrote %d bytes, %d chars -> %s" % (len(raw), len(line), dest))
-    print("sha256: %s" % sha(raw))
+    print(
+        "wrote %d bytes, %d chars -> %s"
+        % (len(payload), len(text), target)
+    )
+    print("sha256: %s" % digest)
 
 
 if __name__ == "__main__":
-    main()
+    run()
